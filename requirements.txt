@@ -4,5 +4,5 @@ requests==2.31.0
 httpx==0.28.1
 gTTS==2.3.2
 groq==0.31.0
-pydantic==1.10.12
-python-multipart==0.0.20
+pydantic==2.5.1
+python-multipart==0.0.6
