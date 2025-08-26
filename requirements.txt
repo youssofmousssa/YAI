@@ -1,7 +1,8 @@
 fastapi==0.111.1
 uvicorn[standard]==0.23.2
 requests==2.31.0
-httpx==0.26.2
-gTTS==2.4.1
-groq==0.2.0   # replace with the correct Groq SDK version
+httpx==0.28.1
+gTTS==2.3.2
+groq==0.5.1      # latest stable Groq SDK version
 pydantic==1.10.12
+python-multipart==0.0.6  # required for Form/File support in FastAPI
