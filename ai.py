@@ -517,4 +517,13 @@ async def moderation(user_input: str = Form(...)):
             top_p=1,
             stream=False,
         ))
-        text =
+        text = _extract_text_from_completion(completion)
+        return {"response": text}
+    except Exception as e:
+        LOG.exception("moderation error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status":"ok", "version":"1.2"}
