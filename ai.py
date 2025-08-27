@@ -2,12 +2,19 @@
 """
 ai_stream.py
 
-Single-file FastAPI backend with streaming support for Groq-based models and
-external media APIs (Flux Pro / DarkAI). Designed to behave like a ChatGPT-style
-backend with real-time streaming, session memory, and media endpoints.
+Improved single-file FastAPI backend with:
+ - SSE-style streaming endpoints that reliably emit chunks
+ - CORS enabled for browser usage (image generation from web clients)
+ - All original endpoints preserved (chat, stream_chat, deep_reasoning,
+   function_calling, image_understanding, image_generation, image_to_video,
+   text_to_video, tts, stt, multilingual, moderation, session management, health)
+ - Robust handling for different Groq SDK return shapes and TTS fallbacks
 
-Run:
+Run (termux / local):
   uvicorn ai_stream:app --reload --host 0.0.0.0 --port 8001
+
+When deploying (Render / other), start with:
+  uvicorn ai_stream:app --host 0.0.0.0 --port $PORT
 """
 
 import os
@@ -17,14 +24,14 @@ import logging
 import asyncio
 import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
-# Groq SDK (must be installed and configured)
+# Groq SDK (ensure correct version installed)
 from groq import Groq
 
 # optional fallback TTS
@@ -36,44 +43,56 @@ except Exception:
 
 # ---------- Configuration ----------
 LOG = logging.getLogger("ai_stream")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 FLUX_PRO_BASE = os.getenv("FLUX_PRO_BASE", "https://sii3.moayman.top/api")
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./media"))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Initialize Groq client (SDK)
+# CORS config: allow browser clients. Use env var ALLOW_ORIGINS to restrict in production.
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",") if os.getenv("ALLOW_ORIGINS") else ["*"]
+
+# Initialize Groq client (SDK) defensively
 try:
     groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else Groq()
 except TypeError:
-    # Some SDKs may not accept api_key param
     groq_client = Groq()
 
-# Async HTTP client for external endpoints
+# Global HTTPX client reused on startup
 httpx_client: Optional[httpx.AsyncClient] = None
 
-app = FastAPI(title="AI Streaming Backend", version="1.2")
+app = FastAPI(title="AI Streaming Backend (improved)", version="1.3")
 
-# In-memory sessions: {session_id: [ {"role":"user"/"assistant","content":str}, ... ]}
+# Add CORS middleware so browser fetches won't fail
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory sessions: {session_id: [ {"role":"user"/"assistant"/"system","content":str}, ... ]}
 SESSIONS: Dict[str, List[Dict[str, str]]] = {}
-
 
 # ---------- Utilities ----------
 def unique_filename(prefix: str, ext: str) -> Path:
     return MEDIA_DIR / f"{prefix}-{uuid.uuid4().hex}.{ext.lstrip('.')}"
 
-async def startup_event():
+async def _startup_event():
     global httpx_client
     httpx_client = httpx.AsyncClient(timeout=60.0)
+    LOG.info("HTTPX client created")
 
-async def shutdown_event():
+async def _shutdown_event():
     global httpx_client
     if httpx_client:
         await httpx_client.aclose()
+        LOG.info("HTTPX client closed")
 
-app.add_event_handler("startup", startup_event)
-app.add_event_handler("shutdown", shutdown_event)
+app.add_event_handler("startup", _startup_event)
+app.add_event_handler("shutdown", _shutdown_event)
 
 
 def _extract_text_from_completion(completion: Any) -> str:
@@ -81,29 +100,97 @@ def _extract_text_from_completion(completion: Any) -> str:
     Defensive extraction of text from various possible SDK response shapes.
     """
     try:
-        # common: completion.choices[0].message.content
+        # object-like with choices
+        if completion is None:
+            return ""
         if hasattr(completion, "choices"):
-            ch0 = completion.choices[0]
-            if hasattr(ch0, "message") and hasattr(ch0.message, "content"):
-                return ch0.message.content
-            # fallback: maybe .choices[0].text or .choices[0].delta.content
-            if hasattr(ch0, "text"):
-                return ch0.text
-            if hasattr(ch0, "delta") and hasattr(ch0.delta, "content"):
-                return ch0.delta.content
-        # if it's a dict-like
+            ch = completion.choices
+            if isinstance(ch, (list, tuple)) and len(ch) > 0:
+                c0 = ch[0]
+                # common shapes
+                if hasattr(c0, "message") and getattr(c0.message, "content", None) is not None:
+                    return c0.message.content
+                if getattr(c0, "text", None) is not None:
+                    return c0.text
+                # streaming delta
+                if getattr(c0, "delta", None) and getattr(c0.delta, "content", None) is not None:
+                    return c0.delta.content
+        # dict-like shapes
         if isinstance(completion, dict):
+            # try message
             try:
                 return completion["choices"][0]["message"]["content"]
             except Exception:
                 pass
-            try:
+            if "text" in completion:
                 return completion["text"]
-            except Exception:
-                pass
+            # try nested forms
+            if "choices" in completion and completion["choices"]:
+                ch0 = completion["choices"][0]
+                if isinstance(ch0, dict) and "text" in ch0:
+                    return ch0["text"]
+        # fallback string
         return str(completion)
     except Exception:
         return str(completion)
+
+
+def _text_from_chunk(chunk: Any) -> str:
+    """
+    Extract content text from streaming chunk objects or dicts.
+    """
+    try:
+        if chunk is None:
+            return ""
+        # if object with choices and delta
+        if hasattr(chunk, "choices"):
+            choices = getattr(chunk, "choices")
+            if choices and len(choices) > 0:
+                c0 = choices[0]
+                # delta content
+                delta = getattr(c0, "delta", None)
+                if delta is not None:
+                    cont = getattr(delta, "content", None)
+                    if cont is not None:
+                        return cont
+                # direct text
+                if getattr(c0, "text", None) is not None:
+                    return c0.text
+                # message
+                msg = getattr(c0, "message", None)
+                if msg is not None and getattr(msg, "content", None) is not None:
+                    return msg.content
+        # dict shape
+        if isinstance(chunk, dict):
+            # try several keys
+            if "choices" in chunk and chunk["choices"]:
+                try:
+                    # streaming delta dict
+                    delta = chunk["choices"][0].get("delta", {})
+                    if isinstance(delta, dict) and delta.get("content"):
+                        return delta.get("content")
+                except Exception:
+                    pass
+                # try text fields
+                try:
+                    return chunk["choices"][0].get("text") or chunk["choices"][0].get("message", {}).get("content", "") or str(chunk)
+                except Exception:
+                    pass
+            if "text" in chunk:
+                return chunk["text"]
+            # fallback to str
+            return str(chunk)
+        # bytes
+        if isinstance(chunk, (bytes, bytearray)):
+            try:
+                return chunk.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(chunk)
+        # fallback
+        return str(chunk)
+    except Exception as e:
+        LOG.debug("Error extracting chunk text: %s", e)
+        return str(chunk)
 
 
 # ---------- Session management ----------
@@ -111,6 +198,7 @@ def _extract_text_from_completion(completion: Any) -> str:
 async def session_create():
     session_id = uuid.uuid4().hex
     SESSIONS[session_id] = []
+    LOG.info("Created session %s", session_id)
     return {"session_id": session_id}
 
 
@@ -132,65 +220,64 @@ async def session_history(session_id: str):
 
 
 # ---------- Streaming helper (SSE-like) ----------
-def start_stream_thread_and_queue(make_iterable_callable, queue: asyncio.Queue):
+def start_stream_thread_and_queue(make_iterable_callable: Callable[[], Any],
+                                  q: asyncio.Queue,
+                                  main_loop: asyncio.AbstractEventLoop):
     """
-    Run make_iterable_callable in a background thread, iterate it synchronously,
-    and put text chunks into asyncio.Queue. Put None sentinel at the end.
+    Start a background thread to iterate the (possibly sync) iterable returned by
+    make_iterable_callable and push text chunks into the provided asyncio.Queue.
+    Use main_loop to schedule queue.put coroutines so they are executed in the
+    main event loop (the one serving the client).
     """
 
     def _worker():
         try:
             iterable = make_iterable_callable()
-            for chunk in iterable:
-                # attempt to extract text
-                text = ""
+            # If the iterable is an async generator/coro-like, run it in a new loop here
+            if hasattr(iterable, "__aiter__") or asyncio.iscoroutine(iterable):
+                # run async iteration in a separate loop inside this thread
                 try:
-                    # If chunk is object with choices -> delta -> content
-                    if hasattr(chunk, "choices"):
-                        c0 = chunk.choices[0]
-                        delta = getattr(c0, "delta", None)
-                        if delta is not None:
-                            content = getattr(delta, "content", None)
-                            if content is not None:
-                                text = content
-                        # sometimes chunk.choices[0].text
-                        if not text and hasattr(c0, "text"):
-                            text = c0.text
-                    elif isinstance(chunk, dict):
-                        try:
-                            text = chunk["choices"][0]["delta"].get("content", "")
-                        except Exception:
-                            text = chunk.get("text", "") or str(chunk)
-                    else:
-                        text = str(chunk)
-                except Exception:
-                    text = str(chunk)
-                # Put text (can be empty)
-                asyncio.run_coroutine_threadsafe(queue.put(text), asyncio.get_event_loop())
-        except Exception as e:
-            # put error string to queue
-            asyncio.run_coroutine_threadsafe(queue.put(f"[STREAM ERROR] {e}"), asyncio.get_event_loop())
+                    async def _run_async_iter():
+                        # if it's a coroutine that returns an async generator, await it
+                        gen = await iterable if asyncio.iscoroutine(iterable) else iterable
+                        async for chunk in gen:
+                            text = _text_from_chunk(chunk)
+                            asyncio.run_coroutine_threadsafe(q.put(text), main_loop)
+                    asyncio.run(_run_async_iter())
+                except Exception as exc:
+                    asyncio.run_coroutine_threadsafe(q.put(f"[STREAM ERROR] {exc}"), main_loop)
+            else:
+                # synchronous iterable/generator
+                for chunk in iterable:
+                    text = _text_from_chunk(chunk)
+                    asyncio.run_coroutine_threadsafe(q.put(text), main_loop)
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(q.put(f"[STREAM ERROR] {exc}"), main_loop)
         finally:
-            asyncio.run_coroutine_threadsafe(queue.put(None), asyncio.get_event_loop())
+            # sentinel None to indicate close
+            asyncio.run_coroutine_threadsafe(q.put(None), main_loop)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
+    return thread
 
 
-async def sse_event_generator(make_iterable_callable):
+async def sse_event_generator(make_iterable_callable: Callable[[], Any]):
     """
     Async generator that yields SSE 'data: <json>\n\n' strings for each chunk.
+    We capture the running loop and pass it to the background thread so run_coroutine_threadsafe
+    has the right target loop.
     """
     q: asyncio.Queue = asyncio.Queue()
-    start_stream_thread_and_queue(make_iterable_callable, q)
+    loop = asyncio.get_running_loop()
+    start_stream_thread_and_queue(make_iterable_callable, q, loop)
 
     while True:
         item = await q.get()
         if item is None:
-            # close
             yield "event: done\ndata: [DONE]\n\n"
             break
-        # safe JSON payload
+        # build a JSON payload per SSE best practice
         payload = {"delta": item}
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -203,22 +290,18 @@ async def stream_chat(session_id: Optional[str] = Form(None),
                       model: str = Form("llama-3.3-70b-versatile"),
                       temperature: float = Form(0.7)):
     """
-    Streamed chat endpoint (SSE). Usage example (curl):
-      curl -N -X POST http://127.0.0.1:8001/stream_chat -F "user_input=Hello" -F "session_id=<id>"
-    If session_id is provided, conversation history will be included in the prompt.
+    Streamed chat endpoint (SSE).
+    Example:
+      curl -N -X POST http://127.0.0.1:8001/stream_chat -F "user_input=Hello"
     """
-    # Build messages from session if exists
     messages = []
     if session_id and session_id in SESSIONS:
         messages.extend(SESSIONS[session_id])
-    # Append new user message (and optionally store it)
     messages.append({"role": "user", "content": user_input})
     if session_id:
         SESSIONS.setdefault(session_id, []).append({"role": "user", "content": user_input})
 
-    # Groq SDK call must be created inside callable for the streaming helper
     def make_iterable():
-        # Use the SDK to create a streaming completion iterable
         payload_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         return groq_client.chat.completions.create(
             model=model,
@@ -229,7 +312,8 @@ async def stream_chat(session_id: Optional[str] = Form(None),
             stream=True,
         )
 
-    return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream")
+    return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/chat")
@@ -237,9 +321,6 @@ async def chat_nonstream(session_id: Optional[str] = Form(None),
                          user_input: str = Form(...),
                          model: str = Form("llama-3.3-70b-versatile"),
                          temperature: float = Form(0.7)):
-    """
-    Non-streaming chat (returns final text).
-    """
     messages = []
     if session_id and session_id in SESSIONS:
         messages.extend(SESSIONS[session_id])
@@ -247,6 +328,7 @@ async def chat_nonstream(session_id: Optional[str] = Form(None),
     if session_id:
         SESSIONS.setdefault(session_id, []).append({"role": "user", "content": user_input})
     try:
+        # run blocking SDK call in thread to avoid blocking event loop
         completion = await asyncio.to_thread(lambda: groq_client.chat.completions.create(
             model=model,
             messages=[{"role": m["role"], "content": m["content"]} for m in messages],
@@ -256,7 +338,6 @@ async def chat_nonstream(session_id: Optional[str] = Form(None),
             stream=False,
         ))
         text = _extract_text_from_completion(completion)
-        # store assistant reply in session
         if session_id:
             SESSIONS[session_id].append({"role": "assistant", "content": text})
         return {"response": text}
@@ -269,9 +350,6 @@ async def chat_nonstream(session_id: Optional[str] = Form(None),
 async def deep_reasoning(user_input: str = Form(...),
                          session_id: Optional[str] = Form(None),
                          stream: Optional[bool] = Form(False)):
-    """
-    Deep reasoning endpoint. Set stream=true to stream responses (SSE).
-    """
     model = "openai/gpt-oss-120b"
     messages = []
     if session_id and session_id in SESSIONS:
@@ -290,7 +368,8 @@ async def deep_reasoning(user_input: str = Form(...),
                 reasoning_effort="medium",
                 stream=True,
             )
-        return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream")
+        return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
         try:
             completion = await asyncio.to_thread(lambda: groq_client.chat.completions.create(
@@ -317,7 +396,7 @@ async def function_calling(user_input: str = Form(...), image_url: Optional[str]
     content = [{"type": "text", "text": user_input}]
     if image_url:
         content.append({"type": "image_url", "image_url": {"url": image_url}})
-    messages = [{"role":"user","content": content}]
+    messages = [{"role": "user", "content": content}]
     if session_id:
         SESSIONS.setdefault(session_id, []).append({"role": "user", "content": user_input})
 
@@ -330,7 +409,8 @@ async def function_calling(user_input: str = Form(...), image_url: Optional[str]
                 max_completion_tokens=1024,
                 stream=True,
             )
-        return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream")
+        return StreamingResponse(sse_event_generator(make_iterable), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     else:
         try:
             completion = await asyncio.to_thread(lambda: groq_client.chat.completions.create(
@@ -342,7 +422,7 @@ async def function_calling(user_input: str = Form(...), image_url: Optional[str]
             ))
             text = _extract_text_from_completion(completion)
             if session_id:
-                SESSIONS[session_id].append({"role":"assistant","content":text})
+                SESSIONS[session_id].append({"role": "assistant", "content": text})
             return {"response": text}
         except Exception as e:
             LOG.exception("function_calling error")
@@ -354,10 +434,10 @@ async def image_understanding(user_input: str = Form(...), image_url: str = Form
                               session_id: Optional[str] = Form(None)):
     model = "meta-llama/llama-4-maverick-17b-128e-instruct"
     content = [
-        {"type":"text","text": user_input},
-        {"type":"image_url","image_url":{"url": image_url}}
+        {"type": "text", "text": user_input},
+        {"type": "image_url", "image_url": {"url": image_url}},
     ]
-    messages = [{"role":"user","content": content}]
+    messages = [{"role": "user", "content": content}]
     if session_id:
         SESSIONS.setdefault(session_id, []).append({"role": "user", "content": user_input})
 
@@ -371,14 +451,16 @@ async def image_understanding(user_input: str = Form(...), image_url: str = Form
         ))
         text = _extract_text_from_completion(completion)
         if session_id:
-            SESSIONS[session_id].append({"role":"assistant","content":text})
+            SESSIONS[session_id].append({"role": "assistant", "content": text})
         return {"response": text}
     except Exception as e:
         LOG.exception("image_understanding error")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ------------------------
 # External media endpoints (async)
+# ------------------------
 @app.post("/image_generation")
 async def image_generation(prompt: str = Form(...)):
     url = f"{FLUX_PRO_BASE.rstrip('/')}/flux-pro.php"
@@ -419,16 +501,13 @@ async def text_to_video(prompt: str = Form(...)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-# TTS endpoint
+# ------------------------
+# TTS endpoint (Groq PlayAI first, fallback to gTTS)
+# ------------------------
 @app.post("/tts")
 async def tts(text: str = Form(...), voice: str = Form("Aaliyah-PlayAI"), lang: str = Form("en")):
-    """
-    Try Groq PlayAI (groq_client.audio.speech.create) with write_to_file or other flows.
-    Fallback to gTTS if Groq TTS isn't available or fails.
-    Returns FileResponse with audio file.
-    """
-    # first try Groq
     out_wav = unique_filename("tts", "wav")
+    # Try Groq-based TTS
     try:
         response = await asyncio.to_thread(lambda: groq_client.audio.speech.create(
             model="playai-tts",
@@ -436,28 +515,31 @@ async def tts(text: str = Form(...), voice: str = Form("Aaliyah-PlayAI"), lang: 
             response_format="wav",
             input=text,
         ))
-        # Many SDKs provide write_to_file on BinaryAPIResponse
+        # Some SDK responses expose write_to_file or write_file methods
         if hasattr(response, "write_to_file"):
             await asyncio.to_thread(lambda: response.write_to_file(str(out_wav)))
             return FileResponse(out_wav, media_type="audio/wav", filename=out_wav.name)
-        elif isinstance(response, (bytes, bytearray)):
+        if hasattr(response, "write_file"):
+            await asyncio.to_thread(lambda: response.write_file(str(out_wav)))
+            return FileResponse(out_wav, media_type="audio/wav", filename=out_wav.name)
+        # If bytes-like
+        if isinstance(response, (bytes, bytearray)):
             out_wav.write_bytes(response)
             return FileResponse(out_wav, media_type="audio/wav", filename=out_wav.name)
-        elif isinstance(response, dict) and response.get("url"):
-            # download URL
+        # If dict with URL -> download
+        if isinstance(response, dict) and response.get("url"):
             async with httpx.AsyncClient() as c:
                 r = await c.get(response["url"], timeout=120)
                 r.raise_for_status()
                 out_wav.write_bytes(r.content)
                 return FileResponse(out_wav, media_type="audio/wav", filename=out_wav.name)
-        else:
-            # write fallback textual representation
-            out_wav.write_text(str(response))
-            return FileResponse(out_wav, media_type="text/plain", filename=out_wav.name)
+        # Otherwise write textual representation so user sees something
+        out_wav.write_text(str(response))
+        return FileResponse(out_wav, media_type="text/plain", filename=out_wav.name)
     except Exception as e:
         LOG.warning("Groq TTS failed: %s", e)
 
-    # fallback: gTTS
+    # fallback to gTTS (if available)
     if GTTS_AVAILABLE:
         out_mp3 = unique_filename("tts", "mp3")
         try:
@@ -470,7 +552,9 @@ async def tts(text: str = Form(...), voice: str = Form("Aaliyah-PlayAI"), lang: 
     raise HTTPException(status_code=500, detail="TTS not available (Groq failed and gTTS not installed).")
 
 
+# ------------------------
 # STT endpoint (Whisper)
+# ------------------------
 @app.post("/stt")
 async def stt(file: UploadFile = File(...)):
     if not file:
@@ -484,7 +568,6 @@ async def stt(file: UploadFile = File(...)):
             model="whisper-large-v3",
             response_format="verbose_json",
         ))
-        # try common attributes
         if hasattr(transcription, "text"):
             return {"text": transcription.text}
         if isinstance(transcription, dict) and "text" in transcription:
@@ -495,7 +578,9 @@ async def stt(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Multilingual non-stream chat
+# ------------------------
+# Multilingual wrapper
+# ------------------------
 @app.post("/multilingual")
 async def multilingual(user_input: str = Form(...), session_id: Optional[str] = Form(None)):
     try:
@@ -505,13 +590,15 @@ async def multilingual(user_input: str = Form(...), session_id: Optional[str] = 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ------------------------
 # Moderation
+# ------------------------
 @app.post("/moderation")
 async def moderation(user_input: str = Form(...)):
     try:
         completion = await asyncio.to_thread(lambda: groq_client.chat.completions.create(
             model="meta-llama/llama-guard-4-12b",
-            messages=[{"role":"user","content":user_input}],
+            messages=[{"role": "user", "content": user_input}],
             temperature=1,
             max_completion_tokens=1024,
             top_p=1,
@@ -526,4 +613,6 @@ async def moderation(user_input: str = Form(...)):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status":"ok", "version":"1.2"}
+    return {"status": "ok", "version": "1.3"}
+
+# End of file
